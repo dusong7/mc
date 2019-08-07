@@ -258,6 +258,9 @@ static name_keymap_t command_names[] = {
     {"ShowNumbers", CK_ShowNumbers},
 #endif
 
+    /* chattr dialog */
+    {"MarkAndDown", CK_MarkAndDown},
+
 #ifdef USE_INTERNAL_EDIT
     {"Close", CK_Close},
     {"Tab", CK_Tab},
