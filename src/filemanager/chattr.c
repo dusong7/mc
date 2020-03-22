@@ -40,7 +40,7 @@
 
 #include "lib/tty/tty.h"        /* tty_print*() */
 #include "lib/tty/color.h"      /* tty_setcolor() */
-#include "lib/skin.h"           /* COLOR_NORMAL */
+#include "lib/skin.h"           /* COLOR_NORMAL, DISABLED_COLOR */
 #include "lib/vfs/vfs.h"
 #include "lib/widget.h"
 
@@ -65,6 +65,17 @@
 #define CHATTRBOXES(x) ((WChattrBoxes *)(x))
 
 /*** file scope type declarations ****************************************************************/
+
+typedef struct WFileAttrText WFileAttrText;
+
+struct WFileAttrText
+{
+    Widget widget;              /* base class */
+
+    char *filename;
+    int filename_width;         /* cached width of file name */
+    char attrs[32 + 1];         /* 32 bits in attributes (unsigned long) */
+};
 
 typedef struct WChattrBoxes WChattrBoxes;
 
@@ -193,8 +204,6 @@ static struct
 /* number of attributes */
 static const size_t check_attr_num = G_N_ELEMENTS (check_attr);
 
-static char attr_str[32 + 1];   /* 32 bits in attributes (unsigned long) */
-
 /* modifable attribute numbers */
 static int check_attr_mod[32];
 static int check_attr_mod_num = 0;      /* 0..31 */
@@ -227,21 +236,133 @@ static gboolean ignore_all;
 
 static unsigned long and_mask, or_mask, flags;
 
-static WLabel *file_attr;
+static WFileAttrText *file_attr;
+
+/* x-coord of widget in the dialog */
+static const int wx = 3;
 
 /* --------------------------------------------------------------------------------------------- */
 /*** file scope functions ************************************************************************/
 /* --------------------------------------------------------------------------------------------- */
 
+static inline gboolean
+chattr_is_modifiable (size_t i)
+{
+    return ((check_attr[i].flags & EXT2_FL_USER_MODIFIABLE) != 0);
+}
+
+/* --------------------------------------------------------------------------------------------- */
+
 static void
-chattr_fill_str (unsigned long attr)
+fileattrtext_fill (WFileAttrText * fat, unsigned long attr)
 {
     size_t i;
 
     for (i = 0; i < check_attr_num; i++)
-        attr_str[i] = (attr & check_attr[i].flags) != 0 ? check_attr[i].attr : '-';
+        fat->attrs[i] = (attr & check_attr[i].flags) != 0 ? check_attr[i].attr : '-';
 
-    attr_str[check_attr_num] = '\0';
+    fat->attrs[check_attr_num] = '\0';
+
+    widget_draw (WIDGET (fat));
+}
+
+/* --------------------------------------------------------------------------------------------- */
+
+static cb_ret_t
+fileattrtext_callback (Widget * w, Widget * sender, widget_msg_t msg, int parm, void *data)
+{
+    WFileAttrText *fat = (WFileAttrText *) w;
+
+    switch (msg)
+    {
+    case MSG_DRAW:
+        {
+            int color;
+            size_t i;
+
+            color = COLOR_NORMAL;
+            tty_setcolor (color);
+
+            if (w->cols > fat->filename_width)
+            {
+                widget_gotoyx (w, 0, (w->cols - fat->filename_width) / 2);
+                tty_print_string (fat->filename);
+            }
+            else
+            {
+                widget_gotoyx (w, 0, 0);
+                tty_print_string (str_trunc (fat->filename, w->cols));
+            }
+
+            /* hope that w->cols is greater than check_attr_num */
+            widget_gotoyx (w, 1, (w->cols - check_attr_num) / 2);
+            for (i = 0; i < check_attr_num; i++)
+            {
+                /* Do not set new color for each symbol. Try to use previous color. */
+                if (chattr_is_modifiable (i))
+                {
+                    if (color == DISABLED_COLOR)
+                    {
+                        color = COLOR_NORMAL;
+                        tty_setcolor (color);
+                    }
+                }
+                else
+                {
+                    if (color != DISABLED_COLOR)
+                    {
+                        color = DISABLED_COLOR;
+                        tty_setcolor (color);
+                    }
+                }
+
+                tty_print_char (fat->attrs[i]);
+            }
+            return MSG_HANDLED;
+        }
+
+    case MSG_RESIZE:
+        {
+            Widget *wo = WIDGET (w->owner);
+
+            widget_default_callback (w, sender, msg, parm, data);
+            /* intially file name may be wider than screen */
+            if (fat->filename_width > wo->cols - wx * 2)
+            {
+                w->x = wo->x + wx;
+                w->cols = wo->cols - wx * 2;
+            }
+            return MSG_HANDLED;
+        }
+
+    case MSG_DESTROY:
+        g_free (fat->filename);
+        return MSG_HANDLED;
+
+    default:
+        return widget_default_callback (w, sender, msg, parm, data);
+    }
+}
+
+/* --------------------------------------------------------------------------------------------- */
+
+static WFileAttrText *
+fileattrtext_new (int y, int x, const char *filename, unsigned long attr)
+{
+    WFileAttrText *fat;
+    int width, cols;
+
+    width = str_term_width1 (filename);
+    cols = MAX (width, (int) check_attr_num);
+
+    fat = g_new (WFileAttrText, 1);
+    widget_init (WIDGET (fat), y, x, 2, cols, fileattrtext_callback, NULL);
+
+    fat->filename = g_strdup (filename);
+    fat->filename_width = width;
+    fileattrtext_fill (fat, attr);
+
+    return fat;
 }
 
 /* --------------------------------------------------------------------------------------------- */
@@ -599,7 +720,7 @@ chattrboxes_execute_cmd (WChattrBoxes * cb, long command)
     case CK_Mark:
     case CK_MarkAndDown:
         {
-            chattr_toggle_select (cb, cb->pos);         /* FIXME */
+            chattr_toggle_select (cb, cb->pos); /* FIXME */
             if (command == CK_MarkAndDown)
                 chattrboxes_down (cb);
 
@@ -651,8 +772,7 @@ chattrboxes_callback (Widget * w, Widget * sender, widget_msg_t msg, int parm, v
                 i += cb->top;
                 m = check_attr_mod[i];
                 flags ^= check_attr[m].flags;
-                chattr_fill_str (flags);
-                label_set_textv (file_attr, "%s: %s", (char *) (DIALOG (w->owner)->data), attr_str);
+                fileattrtext_fill (file_attr, flags);
                 chattr_toggle_select (cb, i);
                 flags_changed = TRUE;
                 return MSG_HANDLED;
@@ -751,14 +871,6 @@ chattrboxes_new (int y, int x, int height, int width)
 
 /* --------------------------------------------------------------------------------------------- */
 
-static inline gboolean
-chattr_is_modifiable (size_t i)
-{
-    return ((check_attr[i].flags & EXT2_FL_USER_MODIFIABLE) != 0);
-}
-
-/* --------------------------------------------------------------------------------------------- */
-
 static void
 chattr_init (void)
 {
@@ -807,6 +919,7 @@ chattr_init (void)
 static WDialog *
 chattr_dlg_create (const char *fname, unsigned long attr)
 {
+    const Widget *mw = CONST_WIDGET (midnight_dlg);
     gboolean single_set;
     WDialog *ch_dlg;
     int lines, cols;
@@ -826,33 +939,41 @@ chattr_dlg_create (const char *fname, unsigned long attr)
 
     single_set = (current_panel->marked < 2);
 
-    lines = 4 + checkboxes_lines + 4;
+    lines = 5 + checkboxes_lines + 4;
     if (!single_set)
         lines += 3;
 
-    if (lines >= WIDGET (midnight_dlg)->lines - 2)
+    if (lines >= mw->lines - 2)
     {
         int dl;
 
-        dl = lines - (WIDGET (midnight_dlg)->lines - 2);
+        dl = lines - (mw->lines - 2);
         lines -= dl;
         checkboxes_lines -= dl;
     }
 
     ch_dlg =
-        dlg_create (TRUE, 0, 0, lines, cols + 6, WPOS_CENTER, FALSE, dialog_colors,
+        dlg_create (TRUE, 0, 0, lines, cols + wx * 2, WPOS_CENTER, FALSE, dialog_colors,
                     dlg_default_callback, NULL, "[Chattr]", _("Chattr command"));
     dg = GROUP (ch_dlg);
     dw = WIDGET (ch_dlg);
 
     y = 2;
-    file_attr = label_new (y++, 3, NULL);
-    group_add_widget (dg, file_attr);
+    file_attr = fileattrtext_new (y, wx, fname, attr);
+    group_add_widget_autopos (dg, file_attr, WPOS_KEEP_TOP | WPOS_CENTER_HORZ, NULL);
+    y += WIDGET (file_attr)->lines;
     group_add_widget (dg, hline_new (y++, -1, -1));
 
-    cb = chattrboxes_new (y++, 3, checkboxes_lines, check_attr_width + cb_scrollbar_width);
+    if (cols < WIDGET (file_attr)->cols)
+    {
+        cols = WIDGET (file_attr)->cols;
+        cols = MIN (cols, mw->cols - wx * 2);
+        widget_set_size (dw, dw->y, dw->x, lines, cols + wx * 2);
+    }
+
+    cb = chattrboxes_new (y++, wx, checkboxes_lines, cols);
     cbg = GROUP (cb);
-    group_add_widget (dg, cb);
+    group_add_widget_autopos (dg, cb, WPOS_KEEP_TOP | WPOS_KEEP_HORZ, NULL);
 
     /* create checkboxes */
     for (i = 0; i < (size_t) check_attr_mod_num && i < (size_t) checkboxes_lines; i++)
@@ -867,9 +988,6 @@ chattr_dlg_create (const char *fname, unsigned long attr)
     }
 
     y += i - 1;
-
-    /* show attributes that are set up */
-    chattr_fill_str (attr);
 
     for (i = single_set ? (BUTTONS - 2) : 0; i < BUTTONS; i++)
     {
@@ -890,35 +1008,9 @@ chattr_dlg_create (const char *fname, unsigned long attr)
         cols = MAX (cols, chattr_but[i - 1].button->cols + 1 + chattr_but[i].button->cols);
     }
 
-    label_set_textv (file_attr, "%s: %s", fname, attr_str);
-    cols = MAX (cols, WIDGET (file_attr)->cols);
-
-    /* adjust dialog size and button positions */
-    if (cols > check_attr_width)
-    {
-        widget_set_size (dw, dw->y, dw->x, lines, cols + 6);
-
-        /* dialog center */
-        cols = dw->x + dw->cols / 2 + 1;
-
-        for (i = single_set ? (BUTTONS - 2) : 0; i < BUTTONS; i++)
-        {
-            Widget *b;
-
-            b = chattr_but[i++].button;
-            widget_set_size (b, b->y, cols - b->cols, b->lines, b->cols);
-
-            b = chattr_but[i].button;
-            widget_set_size (b, b->y, cols + 1, b->lines, b->cols);
-        }
-    }
-
     /* select first checkbox */
     cbg->current = cbg->widgets;
     widget_select (WIDGET (cb));
-
-    /* file name is used in MSG_NOTIFY handling */
-    ch_dlg->data = (void *) fname;
 
     return ch_dlg;
 }
